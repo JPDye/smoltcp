@@ -7,28 +7,32 @@ use super::Controller;
 const BETA_CUBIC: f64 = 0.7;
 const C: f64 = 0.4;
 
+const DEFAULT_MSS: usize = 1024;
+
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Cubic {
-    cwnd: usize,     // Congestion window
-    min_cwnd: usize, // The minimum size of congestion window
-    w_max: usize,    // Window size just before congestion
-    recovery_start: Option<Instant>,
-    rwnd: usize, // Remote window
-    last_update: Instant,
+    w_max: usize, // window size prior to loss
+    cwnd: usize,
+    min_cwnd: usize,
     ssthresh: usize,
+    rwnd: usize,
+
+    recovery_start: Option<Instant>,
+    in_fast_recovery: bool,
 }
 
 impl Cubic {
     pub fn new() -> Cubic {
         Cubic {
-            cwnd: 1024 * 2,
-            min_cwnd: 1024 * 2,
-            w_max: 1024 * 2,
-            recovery_start: None,
-            rwnd: 64 * 1024,
-            last_update: Instant::from_millis(0),
+            w_max: DEFAULT_MSS * 2,
+            cwnd: DEFAULT_MSS * 2,
+            min_cwnd: DEFAULT_MSS * 2,
+            rwnd: 64 * DEFAULT_MSS,
             ssthresh: usize::MAX,
+
+            recovery_start: None,
+            in_fast_recovery: false,
         }
     }
 }
@@ -38,56 +42,38 @@ impl Controller for Cubic {
         self.cwnd
     }
 
-    fn on_rto(&mut self, now: Instant, _in_flight: usize) {
-        self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
-    }
-
-    fn on_dup_ack(&mut self, now: Instant, _len: usize, _in_flight: usize) {
-        self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
-    }
-
-    fn set_remote_window(&mut self, remote_window: usize) {
-        if self.rwnd < remote_window {
-            self.rwnd = remote_window;
-        }
-    }
-
-    fn on_ack(&mut self, _now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
-        // Slow start.
-        if self.cwnd < self.ssthresh {
+    fn on_ack(&mut self, now: Instant, len: usize, _in_flight: usize, _rtt: &RttEstimator) {
+        // First new-data-ack exits fast recovery and deflates `cwnd`
+        if self.in_fast_recovery {
+            self.in_fast_recovery = false;
+            self.cwnd = self.ssthresh;
+            return;
+        } else if self.cwnd < self.ssthresh {
+            // Slow start: increase `cwnd` by 1 MSS per ACK.
             self.cwnd = self
                 .cwnd
-                .saturating_add(len)
+                .saturating_add(len.min(self.min_cwnd))
                 .min(self.rwnd)
                 .max(self.min_cwnd);
-        }
-    }
-
-    fn pre_transmit(&mut self, now: Instant) {
-        let Some(recovery_start) = self.recovery_start else {
-            self.recovery_start = Some(now);
-            return;
-        };
-
-        let now_millis = now.total_millis();
-
-        // If the last update was less than 100ms ago, don't update the congestion window.
-        if self.last_update > recovery_start && now_millis - self.last_update.total_millis() < 100 {
             return;
         }
+
+        // Congestion avoidance: use cubic profile to advance window
+        let recovery_start = self
+            .recovery_start
+            .expect("can't enter CA without having experienced loss");
 
         // Elapsed time since the start of the recovery phase.
-        let t = now_millis - recovery_start.total_millis();
+        let t = now.total_millis() - recovery_start.total_millis();
         if t < 0 {
             return;
         }
 
+        // RFC defines C in segments/sec^3; so scale to bytes/sec^3 since w_max and cwnd are bytes.
+        let c_bytes = C * self.min_cwnd as f64;
+
         // K = (w_max * (1 - beta) / C)^(1/3)
-        let k3 = ((self.w_max as f64) * (1.0 - BETA_CUBIC)) / C;
+        let k3 = ((self.w_max as f64) * (1.0 - BETA_CUBIC)) / c_bytes;
         let k = if let Some(k) = cube_root(k3) {
             k
         } else {
@@ -97,15 +83,64 @@ impl Controller for Cubic {
         // cwnd = C(T - K)^3 + w_max
         let s = t as f64 / 1000.0 - k;
         let s = s * s * s;
-        let cwnd = C * s + self.w_max as f64;
-
-        self.last_update = now;
+        let cwnd = c_bytes * s + self.w_max as f64;
 
         self.cwnd = (cwnd as usize).max(self.min_cwnd).min(self.rwnd);
     }
 
+    fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
+        if self.in_fast_recovery {
+            self.cwnd = self
+                .cwnd
+                .saturating_add(len)
+                .min(self.rwnd)
+                .max(self.min_cwnd);
+        }
+    }
+
+    fn on_loss(&mut self, now: Instant, _in_flight: usize) {
+        // Only cut window size on first entrance to fast recovery.
+        if !self.in_fast_recovery {
+            // TODO: Make this optional?
+            // RFC recommends (SHOULD) disabling if only a single CUBIC flow is on a network.
+            //
+            // RFC 9483.4.7: Fast Convergence
+            // If loss happened at a smaller cwnd than before, it indicates a new flow.
+            // Reduce the cubic plateau more than usual to create headroom.
+            self.w_max = if self.cwnd < self.w_max {
+                ((self.cwnd as f64) * (1.0 + BETA_CUBIC) / 2.0) as usize
+            } else {
+                self.cwnd
+            };
+
+            self.ssthresh = (((self.cwnd as f64) * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
+            self.cwnd = self
+                .ssthresh
+                .saturating_add(3 * self.min_cwnd)
+                .min(self.rwnd);
+
+            self.recovery_start = Some(now);
+            self.in_fast_recovery = true;
+        }
+    }
+
+    fn on_rto(&mut self, now: Instant, in_flight: usize) {
+        self.w_max = self.cwnd;
+        self.ssthresh = (in_flight >> 1).max(2 * self.min_cwnd);
+        self.cwnd = self.min_cwnd;
+
+        self.recovery_start = Some(now);
+        self.in_fast_recovery = false
+    }
+
     fn set_mss(&mut self, mss: usize) {
         self.min_cwnd = mss;
+    }
+
+    fn set_remote_window(&mut self, remote_window: usize) {
+        if self.rwnd < remote_window {
+            self.rwnd = remote_window;
+        }
     }
 }
 
